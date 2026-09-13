@@ -1,233 +1,162 @@
 from collections import namedtuple, deque, Counter
-
 import pickle
 import random
 from typing import List
-
 import numpy as np
-
 import events as e
-from .callbacks import ACTIONS, state_to_features, nearest_coin_distance, compute_danger_tiles, bomb_would_hit_crate
+from .callbacks import (ACTIONS, state_to_features, nearest_coin_distance, nearest_crate_distance,
+    compute_danger_tiles, bomb_would_hit_crate, bomb_would_hit_opponents, is_safe_to_bomb, valid_action_mask)
 
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
-
-TRANSITION_HISTORY_SIZE = 5000  # replay buffer size -- this is now actually used for learning
-
-ALPHA = 0.02  # learning rate (lowered: we now do many more updates per step via replay)
-GAMMA = 0.9   # discount factor
-REPLAY_BATCH_SIZE = 16  # extra past transitions replayed per step, on top of the fresh one
-
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward', 'next_valid'))
+TRANSITION_HISTORY_SIZE = 5000
+ALPHA = 0.01
+GAMMA = 0.85
+REPLAY_BATCH_SIZE = 4
 EPSILON_START = 0.3
-EPSILON_MIN = 0.1  # kept higher than before so training can keep escaping bad local policies
+EPSILON_MIN = 0.1
 EPSILON_DECAY = 0.997
 
-# Custom events for reward shaping
-MOVED_TOWARDS_COIN = "MOVED_TOWARDS_COIN"
-MOVED_AWAY_FROM_COIN = "MOVED_AWAY_FROM_COIN"
-ENTERED_DANGER = "ENTERED_DANGER"
-STAYED_IN_DANGER = "STAYED_IN_DANGER"
-MOVED_TO_SAFETY = "MOVED_TO_SAFETY"
-USELESS_BOMB = "USELESS_BOMB"
-REVERSED_DIRECTION = "REVERSED_DIRECTION"
-STALLING = "STALLING"
+MOVED_TOWARDS_COIN = 'MOVED_TOWARDS_COIN'
+MOVED_AWAY_FROM_COIN = 'MOVED_AWAY_FROM_COIN'
+MOVED_TOWARDS_CRATE = 'MOVED_TOWARDS_CRATE'
+MOVED_AWAY_FROM_CRATE = 'MOVED_AWAY_FROM_CRATE'
+ENTERED_DANGER = 'ENTERED_DANGER'
+STAYED_IN_DANGER = 'STAYED_IN_DANGER'
+MOVED_TO_SAFETY = 'MOVED_TO_SAFETY'
+USELESS_BOMB = 'USELESS_BOMB'
+USEFUL_BOMB = 'USEFUL_BOMB'
+BOMB_TARGETS_OPPONENT = 'BOMB_TARGETS_OPPONENT'
+RISKY_BOMB_DROPPED = 'RISKY_BOMB_DROPPED'
+REVERSED_DIRECTION = 'REVERSED_DIRECTION'
+STALLING = 'STALLING'
 
-# Events we track counts of per episode, purely for diagnostics in the CSV
-TRACKED_EVENTS = [
-    e.COIN_COLLECTED, e.INVALID_ACTION, e.BOMB_DROPPED, e.WAITED,
-    e.KILLED_SELF, e.GOT_KILLED, e.KILLED_OPPONENT,
-    MOVED_TOWARDS_COIN, MOVED_AWAY_FROM_COIN,
-    ENTERED_DANGER, STAYED_IN_DANGER, MOVED_TO_SAFETY, USELESS_BOMB,
-    REVERSED_DIRECTION, STALLING,
-]
+TRACKED_EVENTS = [e.COIN_COLLECTED, e.COIN_FOUND, e.CRATE_DESTROYED, e.INVALID_ACTION, e.BOMB_DROPPED,
+    e.WAITED, e.KILLED_SELF, e.GOT_KILLED, e.KILLED_OPPONENT, MOVED_TOWARDS_COIN, MOVED_AWAY_FROM_COIN,
+    MOVED_TOWARDS_CRATE, MOVED_AWAY_FROM_CRATE, ENTERED_DANGER, STAYED_IN_DANGER, MOVED_TO_SAFETY,
+    USELESS_BOMB, USEFUL_BOMB, BOMB_TARGETS_OPPONENT, RISKY_BOMB_DROPPED, REVERSED_DIRECTION, STALLING]
 
 
 def setup_training(self):
-    """Called after `setup` in callbacks.py when training is enabled."""
     self.transitions = deque(maxlen=TRANSITION_HISTORY_SIZE)
     self.episode_reward = 0.0
     self.episode_counts = Counter()
     self.epsilon = EPSILON_START
     self.recent_positions = deque(maxlen=2)
-    self.stall_counter = 0  # steps since the agent last got closer to a coin
-
-    header = "round,total_reward,steps,epsilon," + ",".join(TRACKED_EVENTS) + "\n"
-    with open("training_rewards.csv", "w") as f:
-        f.write(header)
+    self.stall_counter = 0
+    with open('training_rewards.csv', 'w') as f:
+        f.write('round,total_reward,steps,epsilon,' + ','.join(TRACKED_EVENTS) + '\n')
 
 
 def game_events_occurred(self, old_game_state: dict, self_action: str, new_game_state: dict, events: List[str]):
-    self.logger.debug(f'Encountered game event(s) {", ".join(map(repr, events))} in step {new_game_state["step"]}')
-
     add_custom_events(self, old_game_state, new_game_state, events)
     self.episode_counts.update(ev for ev in events if ev in TRACKED_EVENTS)
-
     old_features = state_to_features(old_game_state)
     new_features = state_to_features(new_game_state)
     reward = reward_from_events(self, events)
     self.episode_reward += reward
-
-    self.transitions.append(Transition(old_features, self_action, new_features, reward))
-    update_q(self, old_features, self_action, new_features, reward)
+    next_valid = valid_action_mask(new_game_state)
+    self.transitions.append(Transition(old_features, self_action, new_features, reward, next_valid))
+    update_q(self, old_features, self_action, new_features, reward, next_valid)
     replay_from_buffer(self)
 
 
 def end_of_round(self, last_game_state: dict, last_action: str, events: List[str]):
-    self.logger.debug(f'Encountered event(s) {", ".join(map(repr, events))} in final step')
     self.episode_counts.update(ev for ev in events if ev in TRACKED_EVENTS)
-
     last_features = state_to_features(last_game_state)
     reward = reward_from_events(self, events)
     self.episode_reward += reward
-
-    self.transitions.append(Transition(last_features, last_action, None, reward))
-    update_q(self, last_features, last_action, None, reward)
+    self.transitions.append(Transition(last_features, last_action, None, reward, None))
+    update_q(self, last_features, last_action, None, reward, None)
     replay_from_buffer(self)
-
-    counts_str = ",".join(str(self.episode_counts.get(ev, 0)) for ev in TRACKED_EVENTS)
-    with open("training_rewards.csv", "a") as f:
-        f.write(f"{last_game_state['round']},{self.episode_reward},{last_game_state['step']},{self.epsilon:.4f},{counts_str}\n")
-
+    counts = ','.join(str(self.episode_counts.get(ev, 0)) for ev in TRACKED_EVENTS)
+    with open('training_rewards.csv', 'a') as f:
+        f.write(f"{last_game_state['round']},{self.episode_reward},{last_game_state['step']},{self.epsilon:.4f},{counts}\n")
     self.episode_reward = 0.0
     self.episode_counts = Counter()
     self.epsilon = max(EPSILON_MIN, self.epsilon * EPSILON_DECAY)
     self.recent_positions.clear()
     self.stall_counter = 0
-
-    with open("my-saved-model.pt", "wb") as file:
-        pickle.dump(self.model, file)
+    with open('my-saved-model.pt', 'wb') as f:
+        pickle.dump(self.model, f)
 
 
 def add_custom_events(self, old_game_state, new_game_state, events):
-    """Reward shaping: coin progress, bomb danger, plus an anti-oscillation
-    penalty for literally walking back to the tile you were on two steps
-    ago (the classic left-right / up-down flip-flop trap)."""
-    old_dist = nearest_coin_distance(old_game_state)
-    new_dist = nearest_coin_distance(new_game_state)
-    if old_dist is not None and new_dist is not None:
-        if new_dist < old_dist:
-            events.append(MOVED_TOWARDS_COIN)
-        elif new_dist > old_dist:
-            events.append(MOVED_AWAY_FROM_COIN)
+    old_coin = nearest_coin_distance(old_game_state)
+    new_coin = nearest_coin_distance(new_game_state)
+    old_crate = nearest_crate_distance(old_game_state)
+    new_crate = nearest_crate_distance(new_game_state)
+
+    if old_coin is not None and new_coin is not None:
+        if new_coin < old_coin: events.append(MOVED_TOWARDS_COIN)
+        elif new_coin > old_coin: events.append(MOVED_AWAY_FROM_COIN)
+    elif old_crate is not None and new_crate is not None:
+        if new_crate < old_crate: events.append(MOVED_TOWARDS_CRATE)
+        elif new_crate > old_crate: events.append(MOVED_AWAY_FROM_CRATE)
 
     _, _, _, old_pos = old_game_state['self']
     _, _, _, new_pos = new_game_state['self']
     old_danger = compute_danger_tiles(old_game_state['field'], old_game_state['bombs'], old_game_state['explosion_map'])
     new_danger = compute_danger_tiles(new_game_state['field'], new_game_state['bombs'], new_game_state['explosion_map'])
-    was_in_danger = old_pos in old_danger
-    now_in_danger = new_pos in new_danger
+    was_danger, now_danger = old_pos in old_danger, new_pos in new_danger
+    if now_danger and was_danger: events.append(STAYED_IN_DANGER)
+    elif now_danger: events.append(ENTERED_DANGER)
+    elif was_danger: events.append(MOVED_TO_SAFETY)
 
-    if now_in_danger and was_in_danger:
-        events.append(STAYED_IN_DANGER)
-    elif now_in_danger and not was_in_danger:
-        events.append(ENTERED_DANGER)
-    elif was_in_danger and not now_in_danger:
-        events.append(MOVED_TO_SAFETY)
+    if e.BOMB_DROPPED in events:
+        hits_crate = bomb_would_hit_crate(old_game_state['field'], old_pos)
+        hits_opponent = bomb_would_hit_opponents(old_game_state['field'], old_pos, old_game_state['others'])
+        if hits_crate: events.append(USEFUL_BOMB)
+        if hits_opponent: events.append(BOMB_TARGETS_OPPONENT)
+        if not hits_crate and not hits_opponent: events.append(USELESS_BOMB)
+        if not is_safe_to_bomb(old_game_state['field'], old_game_state['bombs'], old_game_state['others'], old_pos):
+            events.append(RISKY_BOMB_DROPPED)
 
-    if e.BOMB_DROPPED in events and not bomb_would_hit_crate(old_game_state['field'], old_pos):
-        events.append(USELESS_BOMB)
-
-    # Escalating penalty for going a long time without getting any closer
-    # to a coin -- this is the general-purpose safety valve against
-    # getting permanently stuck, regardless of the specific numerical
-    # reason a fixed point (a WAIT-preference, a 2-tile bounce, etc.)
-    # formed in the first place. Any real progress resets the counter.
-    if old_dist is not None and new_dist is not None and new_dist < old_dist:
+    if ((old_coin is not None and new_coin is not None and new_coin < old_coin) or
+        (old_coin is None and old_crate is not None and new_crate is not None and new_crate < old_crate)):
         self.stall_counter = 0
     else:
         self.stall_counter += 1
-    if self.stall_counter > 10:
-        events.append(STALLING)
+    if self.stall_counter > 10: events.append(STALLING)
 
-    # Anti-oscillation: did we just walk straight back to where we were
-    # two steps ago? recent_positions holds [pos_two_steps_ago, pos_last_step]
-    # going into this call.
-    if not self.recent_positions:
-        self.recent_positions.append(old_pos)
+    if not self.recent_positions: self.recent_positions.append(old_pos)
     if new_pos != old_pos:
         if len(self.recent_positions) == 2 and new_pos == self.recent_positions[0]:
             events.append(REVERSED_DIRECTION)
         self.recent_positions.append(new_pos)
 
 
-def update_q(self, old_features, action, new_features, reward):
-    """
-    Double Q-learning update. Standard single-network Q-learning uses
-    max_a' Q(s', a') as part of its own target -- since Q is a noisy
-    estimate, the max operator systematically overestimates, and that
-    inflated value gets bootstrapped backward into every preceding
-    state via gamma. WAIT is especially prone to soaking up this bias:
-    it's barely penalized directly, but still gets full credit for
-    whatever good happens later in the trajectory purely through
-    bootstrapping.
-
-    Double Q-learning breaks this by using one network to pick the best
-    next action and the OTHER, independently-updated network to
-    evaluate it -- an overestimate in one is unlikely to be mirrored in
-    the other, so it doesn't get selected as often.
-    """
-    if old_features is None or action not in ACTIONS:
-        return
-    action_idx = ACTIONS.index(action)
-
-    # Flip a coin: update model[0] using model[1] to evaluate the next
-    # state, or vice versa.
+def update_q(self, old_features, action, new_features, reward, next_valid):
+    if old_features is None or action not in ACTIONS: return
+    a = ACTIONS.index(action)
     i, j = (0, 1) if random.random() < 0.5 else (1, 0)
-
-    old_q = self.model[i][action_idx].dot(old_features)
-    if new_features is not None:
-        best_next_action = int(np.argmax(self.model[i] @ new_features))
-        max_next_q = self.model[j][best_next_action].dot(new_features)
+    old_q = self.model[i][a].dot(old_features)
+    if new_features is not None and next_valid is not None and np.any(next_valid):
+        q_next = np.where(next_valid, self.model[i] @ new_features, -np.inf)
+        best = int(np.argmax(q_next))
+        next_q = self.model[j][best].dot(new_features)
     else:
-        max_next_q = 0.0  # terminal state: no future reward
-
-    td_error = reward + GAMMA * max_next_q - old_q
-    self.model[i][action_idx] += ALPHA * td_error * old_features
+        next_q = 0.0
+    target = float(np.clip(reward + GAMMA * next_q, -15.0, 15.0))
+    self.model[i][a] += ALPHA * (target - old_q) * old_features
 
 
 def replay_from_buffer(self):
-    """
-    Re-run the Q-update on a random sample of past transitions, not just
-    the one that just happened. Using only the freshest transition every
-    time makes consecutive updates highly correlated, which is a known
-    source of instability for linear function approximation combined with
-    bootstrapping -- it can lock the policy into a self-consistent but
-    wrong two-state cycle (e.g. tile A says "go right", tile B says "go
-    left back to A", forever). Repeatedly re-learning from a random mix
-    of older experience counteracts that by not letting any single recent
-    update dominate.
-    """
-    if len(self.transitions) < REPLAY_BATCH_SIZE:
-        return
-    batch = random.sample(self.transitions, REPLAY_BATCH_SIZE)
-    for transition in batch:
-        update_q(self, transition.state, transition.action, transition.next_state, transition.reward)
+    if len(self.transitions) < REPLAY_BATCH_SIZE: return
+    for t in random.sample(self.transitions, REPLAY_BATCH_SIZE):
+        update_q(self, t.state, t.action, t.next_state, t.reward, t.next_valid)
 
 
 def reward_from_events(self, events: List[str]) -> float:
-    """
-    Map game events (and our own custom ones) to a scalar reward.
-    """
-    game_rewards = {
-        e.COIN_COLLECTED: 1.0,
-        e.KILLED_OPPONENT: 5.0,
-        e.KILLED_SELF: -5.0,
-        e.GOT_KILLED: -5.0,
-        e.INVALID_ACTION: -1.0,
-        e.WAITED: -0.4,
-        MOVED_TOWARDS_COIN: 0.1,
-        MOVED_AWAY_FROM_COIN: -0.1,
-        STAYED_IN_DANGER: -0.3,
-        ENTERED_DANGER: -0.3,
-        MOVED_TO_SAFETY: 0.3,
-        USELESS_BOMB: -0.5,
+    rewards = {
+        e.COIN_COLLECTED: 1.0, e.COIN_FOUND: 0.2, e.CRATE_DESTROYED: 0.1,
+        e.KILLED_OPPONENT: 5.0, e.KILLED_SELF: -5.0, e.GOT_KILLED: -5.0,
+        e.INVALID_ACTION: -1.0, e.WAITED: -0.4,
+        MOVED_TOWARDS_COIN: 0.10, MOVED_AWAY_FROM_COIN: -0.10,
+        MOVED_TOWARDS_CRATE: 0.07, MOVED_AWAY_FROM_CRATE: -0.07,
+        STAYED_IN_DANGER: -0.30, ENTERED_DANGER: -0.30, MOVED_TO_SAFETY: 0.30,
+        USELESS_BOMB: -0.50, USEFUL_BOMB: 1.0, BOMB_TARGETS_OPPONENT: 1.0,
+        RISKY_BOMB_DROPPED: -1.0, REVERSED_DIRECTION: -0.50,
     }
-    reward_sum = sum(game_rewards.get(event, 0.0) for event in events)
-
-    if STALLING in events:
-        # Grows the longer the agent goes without progress, so it
-        # eventually overwhelms any fixed-size bias that's keeping it
-        # stuck, no matter how that bias arose.
-        reward_sum += -0.1 * (self.stall_counter - 10)
-
-    self.logger.info(f"Awarded {reward_sum:.2f} for events {', '.join(events)}")
-    return reward_sum
+    total = sum(rewards.get(ev, 0.0) for ev in events)
+    if STALLING in events: total -= 0.1 * (self.stall_counter - 10)
+    return total

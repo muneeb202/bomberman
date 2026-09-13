@@ -2,234 +2,312 @@ import os
 import pickle
 import random
 from collections import deque
-
 import numpy as np
-
 
 ACTIONS = ['UP', 'RIGHT', 'DOWN', 'LEFT', 'WAIT', 'BOMB']
 DIRECTIONS = [('UP', 0, -1), ('RIGHT', 1, 0), ('DOWN', 0, 1), ('LEFT', -1, 0)]
-
-# bias(1) + coin-direction onehot(4) + free-direction flags(4)
-# + in_danger(1) + escape-direction onehot(4) + bomb_possible(1)
-FEATURE_DIM = 15
+FEATURE_DIM = 26
+STALL_WATCH_STEPS = 6
 
 
 def setup(self):
-    """
-    Setup your code. This is called once when loading each agent.
-
-    The model is a pair of independent linear Q-functions (Double
-    Q-learning): Q_A(s, a) = model[0][a] . phi(s), Q_B likewise with
-    model[1]. Action selection uses their average; train.py's update_q
-    uses one to pick the best next action and the other to evaluate it,
-    which prevents the max-bootstrapping overestimation that a single
-    Q-function is prone to.
-    """
-    if self.train or not os.path.isfile("my-saved-model.pt"):
-        self.logger.info("Setting up model from scratch.")
+    if self.train or not os.path.isfile('my-saved-model.pt'):
         self.model = np.zeros((2, len(ACTIONS), FEATURE_DIM), dtype=np.float32)
     else:
-        self.logger.info("Loading model from saved state.")
-        with open("my-saved-model.pt", "rb") as file:
-            self.model = pickle.load(file)
+        with open('my-saved-model.pt', 'rb') as f:
+            self.model = pickle.load(f)
+        if self.model.shape != (2, len(ACTIONS), FEATURE_DIM):
+            self.logger.warning('Incompatible model shape %s; starting fresh.', self.model.shape)
+            self.model = np.zeros((2, len(ACTIONS), FEATURE_DIM), dtype=np.float32)
+    self._stall_watch = deque(maxlen=STALL_WATCH_STEPS)
+    self._position_history = deque(maxlen=4)
+    self._last_action = None
 
 
-def act(self, game_state: dict) -> str:
-    """
-    Epsilon-greedy policy over the averaged Double Q-function.
-
-    self.epsilon is set/decayed in train.py's setup_training/end_of_round.
-    Outside training (or before setup_training has run) we fall back to a
-    small fixed value so this still behaves sensibly if called directly.
-    """
+def act(self, game_state):
     epsilon = getattr(self, 'epsilon', 0.1)
-    if self.train and random.random() < epsilon:
-        self.logger.debug("Choosing action purely at random.")
-        return np.random.choice(ACTIONS, p=[.2, .2, .2, .2, .1, .1])
-
-    features = state_to_features(game_state)
-    q_values = (self.model[0] + self.model[1]) @ features / 2.0
-
     valid = valid_action_mask(game_state)
-    q_values = np.where(valid, q_values, -np.inf)
+    _, _, _, pos = game_state['self']
+    self._stall_watch.append(pos)
+    self._position_history.append(pos)
 
-    self.logger.debug(f"Q-values: {q_values}")
-    return ACTIONS[int(np.argmax(q_values))]
+    # Task 2: if no coin is currently reachable, immediately use a safe,
+    # useful bomb instead of allowing the linear model to wander forever.
+    coin_dist = nearest_coin_distance(game_state)
+    if valid[5] and coin_dist is None and bomb_would_hit_crate(game_state['field'], pos):
+        self._last_action = 'BOMB'
+        self._stall_watch.clear()
+        return 'BOMB'
+
+    # Break WAIT loops.
+    if len(self._stall_watch) == STALL_WATCH_STEPS and len(set(self._stall_watch)) == 1:
+        moves = [a for a, ok in zip(ACTIONS[:4], valid[:4]) if ok]
+        if moves:
+            self._stall_watch.clear()
+            choice = random.choice(moves)
+            self._last_action = choice
+            return choice
+
+    # Epsilon exploration, but bias exploration toward movement and useful bombs.
+    if self.train and random.random() < epsilon:
+        legal = [a for a, ok in zip(ACTIONS, valid) if ok]
+        if not legal:
+            return 'WAIT'
+        weights = []
+        for a in legal:
+            if a == 'BOMB' and bomb_would_hit_crate(game_state['field'], pos):
+                weights.append(0.30)
+            elif a in ACTIONS[:4]:
+                weights.append(0.20)
+            elif a == 'WAIT':
+                weights.append(0.05)
+            else:
+                weights.append(0.05)
+        weights = np.asarray(weights, dtype=float)
+        weights /= weights.sum()
+        choice = np.random.choice(legal, p=weights)
+        self._last_action = choice
+        return choice
+
+    q = (self.model[0] + self.model[1]) @ state_to_features(game_state) / 2.0
+    q = np.where(valid, q, -np.inf)
+
+    # WAIT should lose whenever there is another movement option.
+    if any(valid[:4]):
+        q[4] -= 0.35
+
+    # Never immediately undo the previous move when another route exists.
+    reverse = {'UP': 'DOWN', 'DOWN': 'UP', 'LEFT': 'RIGHT', 'RIGHT': 'LEFT'}.get(self._last_action)
+    if reverse and valid[ACTIONS.index(reverse)] and sum(valid[:4]) > 1:
+        q[ACTIONS.index(reverse)] = -np.inf
+
+    # Strongly prefer a safe bomb that actually destroys a crate.
+    if valid[5] and bomb_would_hit_crate(game_state['field'], pos):
+        q[5] += 1.5 if coin_dist is not None else 3.0
+
+    # Detect A-B-A-B cycles and avoid returning to the previous tile.
+    if len(self._position_history) == 4:
+        p = list(self._position_history)
+        if p[0] == p[2] and p[1] == p[3] and p[0] != p[1]:
+            if reverse and valid[ACTIONS.index(reverse)]:
+                q[ACTIONS.index(reverse)] = -np.inf
+
+    best = np.flatnonzero(q == np.max(q))
+    choice = ACTIONS[int(np.random.choice(best))] if len(best) else 'WAIT'
+    self._last_action = choice
+    return choice
 
 
-def valid_action_mask(game_state: dict) -> np.array:
-    """Boolean array over ACTIONS marking which are currently legal."""
-    field = game_state['field']
-    bombs = game_state['bombs']
-    others = game_state['others']
+def valid_action_mask(game_state):
+    field, bombs, others = game_state['field'], game_state['bombs'], game_state['others']
     _, _, bomb_possible, (x, y) = game_state['self']
-
-    mask = []
-    for _, dx, dy in DIRECTIONS:
-        mask.append(is_free(field, bombs, others, x + dx, y + dy))
-    mask.append(True)           # WAIT is always legal
-    mask.append(bomb_possible)  # BOMB only if own bomb isn't ticking
-    return np.array(mask)
+    mask = [is_free(field, bombs, others, x + dx, y + dy) for _, dx, dy in DIRECTIONS]
+    mask.append(True)
+    mask.append(bomb_possible and is_safe_to_bomb(field, bombs, others, (x, y)))
+    return np.asarray(mask, dtype=bool)
 
 
-def is_free(field: np.array, bombs, others, x: int, y: int) -> bool:
-    """Whether tile (x, y) can currently be moved onto."""
-    width, height = field.shape
-    if not (0 <= x < width and 0 <= y < height):
-        return False
-    if field[x, y] != 0:
+def is_free(field, bombs, others, x, y):
+    w, h = field.shape
+    if not (0 <= x < w and 0 <= y < h) or field[x, y] != 0:
         return False
     if any((bx, by) == (x, y) for (bx, by), _ in bombs):
         return False
-    if any((ox, oy) == (x, y) for _, _, _, (ox, oy) in others):
-        return False
-    return True
+    return not any((ox, oy) == (x, y) for _, _, _, (ox, oy) in others)
 
 
-def bfs(field: np.array, bombs, others, start: tuple):
-    """
-    Breadth-first search over free tiles starting at `start`.
-    Returns (dist, first_step): shortest distance to, and the first move
-    direction toward, every reachable tile.
-    """
-    dist = {start: 0}
-    first_step = {start: None}
+def bfs(field, bombs, others, start, danger=None):
+    danger = danger or set()
+    dist, first = {start: 0}, {start: None}
     queue = deque([start])
     while queue:
-        cx, cy = queue.popleft()
+        x, y = queue.popleft()
         for name, dx, dy in DIRECTIONS:
-            nx, ny = cx + dx, cy + dy
-            if (nx, ny) not in dist and is_free(field, bombs, others, nx, ny):
-                dist[(nx, ny)] = dist[(cx, cy)] + 1
-                first_step[(nx, ny)] = first_step[(cx, cy)] or name
-                queue.append((nx, ny))
-    return dist, first_step
+            p = (x + dx, y + dy)
+            if p in dist or not is_free(field, bombs, others, *p) or p in danger:
+                continue
+            dist[p] = dist[(x, y)] + 1
+            first[p] = first[(x, y)] or name
+            queue.append(p)
+    return dist, first
 
 
-def nearest_coin_distance(game_state: dict):
-    """Shortest-path distance to the nearest coin, or None if none reachable."""
-    if game_state is None or not game_state['coins']:
-        return None
-    field = game_state['field']
-    bombs = game_state['bombs']
-    others = game_state['others']
-    _, _, _, pos = game_state['self']
-    dist, _ = bfs(field, bombs, others, pos)
-    reachable = [dist[c] for c in game_state['coins'] if c in dist]
-    return min(reachable) if reachable else None
-
-
-def compute_danger_tiles(field: np.array, bombs, explosion_map: np.array) -> set:
-    """
-    All tiles that are currently, or will imminently be, inside a blast.
-    A blast travels up to 3 tiles in each direction from a bomb, stopped
-    by stone walls; it also destroys (and is stopped by) the first crate
-    it hits. Tiles already on fire (explosion_map > 0) are included too.
-    """
-    width, height = field.shape
+def compute_danger_tiles(field, bombs, explosion_map):
+    w, h = field.shape
     danger = set()
-    for (bx, by), _timer in bombs:
+    for (bx, by), _ in bombs:
         danger.add((bx, by))
         for _, dx, dy in DIRECTIONS:
             for step in range(1, 4):
-                nx, ny = bx + dx * step, by + dy * step
-                if not (0 <= nx < width and 0 <= ny < height):
+                x, y = bx + dx * step, by + dy * step
+                if not (0 <= x < w and 0 <= y < h) or field[x, y] == -1:
                     break
-                if field[nx, ny] == -1:  # stone wall stops the blast
-                    break
-                danger.add((nx, ny))
-                if field[nx, ny] == 1:   # crate stops the blast beyond it
+                danger.add((x, y))
+                if field[x, y] == 1:
                     break
     xs, ys = np.where(explosion_map > 0)
     danger.update(zip(xs.tolist(), ys.tolist()))
     return danger
 
 
-def bomb_would_hit_crate(field: np.array, pos: tuple) -> bool:
-    """Whether a bomb dropped at `pos` would reach at least one crate."""
-    width, height = field.shape
-    px, py = pos
+def bomb_would_hit_crate(field, pos):
+    w, h = field.shape
+    x0, y0 = pos
     for _, dx, dy in DIRECTIONS:
         for step in range(1, 4):
-            nx, ny = px + dx * step, py + dy * step
-            if not (0 <= nx < width and 0 <= ny < height):
+            x, y = x0 + dx * step, y0 + dy * step
+            if not (0 <= x < w and 0 <= y < h) or field[x, y] == -1:
                 break
-            if field[nx, ny] == -1:  # stone wall stops the blast
-                break
-            if field[nx, ny] == 1:   # crate found within range
+            if field[x, y] == 1:
                 return True
     return False
 
 
-def bfs_escape(field: np.array, bombs, others, danger: set, start: tuple):
-    """
-    If `start` is inside `danger`, returns the first-step direction toward
-    the nearest tile that is NOT in danger. Returns None if not in danger,
-    or if no escape route is found.
-    """
+def bomb_would_hit_opponents(field, pos, others):
+    w, h = field.shape
+    targets = {p for _, _, _, p in others}
+    x0, y0 = pos
+    for _, dx, dy in DIRECTIONS:
+        for step in range(1, 4):
+            x, y = x0 + dx * step, y0 + dy * step
+            if not (0 <= x < w and 0 <= y < h) or field[x, y] == -1:
+                break
+            if (x, y) in targets:
+                return True
+            if field[x, y] == 1:
+                break
+    return False
+
+
+def bfs_distance_to_safe(field, bombs, others, danger, start):
     if start not in danger:
-        return None
-    dist = {start: 0}
-    first_step = {start: None}
-    queue = deque([start])
+        return 0
+    dist, queue = {start: 0}, deque([start])
     while queue:
-        cx, cy = queue.popleft()
-        if (cx, cy) != start and (cx, cy) not in danger:
-            return first_step[(cx, cy)]
-        for name, dx, dy in DIRECTIONS:
-            nx, ny = cx + dx, cy + dy
-            if (nx, ny) not in dist and is_free(field, bombs, others, nx, ny):
-                dist[(nx, ny)] = dist[(cx, cy)] + 1
-                first_step[(nx, ny)] = first_step[(cx, cy)] or name
-                queue.append((nx, ny))
+        x, y = queue.popleft()
+        if (x, y) != start and (x, y) not in danger:
+            return dist[(x, y)]
+        for _, dx, dy in DIRECTIONS:
+            p = (x + dx, y + dy)
+            if p in dist or not is_free(field, bombs, others, *p):
+                continue
+            dist[p] = dist[(x, y)] + 1
+            queue.append(p)
     return None
 
 
-def state_to_features(game_state: dict) -> np.array:
-    """
-    Feature vector phi(s):
-      [0]     bias term (always 1)
-      [1:5]   one-hot direction (UP, RIGHT, DOWN, LEFT) of the shortest path
-              to the nearest coin (all zero if none reachable)
-      [5:9]   whether each of (UP, RIGHT, DOWN, LEFT) is currently free
-      [9]     1 if the agent's current tile is inside a bomb blast (now or
-              imminently), else 0
-      [10:14] one-hot escape direction toward the nearest safe tile
-              (all zero if not in danger, or no escape route found)
-      [14]    1 if dropping a bomb is currently legal, else 0
-    """
+def bfs_escape(field, bombs, others, danger, start):
+    if start not in danger:
+        return None
+    dist, first, queue = {start: 0}, {start: None}, deque([start])
+    while queue:
+        x, y = queue.popleft()
+        if (x, y) != start and (x, y) not in danger:
+            return first[(x, y)]
+        for name, dx, dy in DIRECTIONS:
+            p = (x + dx, y + dy)
+            if p in dist or not is_free(field, bombs, others, *p):
+                continue
+            dist[p] = dist[(x, y)] + 1
+            first[p] = first[(x, y)] or name
+            queue.append(p)
+    return None
+
+
+def is_safe_to_bomb(field, bombs, others, pos):
+    hypothetical = list(bombs) + [(pos, 3)]
+    danger = compute_danger_tiles(field, hypothetical, np.zeros_like(field))
+    steps = bfs_distance_to_safe(field, hypothetical, others, danger, pos)
+    return steps is not None and steps <= 3
+
+
+def direction_onehot(direction):
+    return [int(direction == name) for name, _, _ in DIRECTIONS]
+
+
+def nearest_target_direction(dist, first_step, targets):
+    reachable = [t for t in targets if t in dist]
+    if not reachable:
+        return None
+    return first_step[min(reachable, key=dist.get)]
+
+
+def crate_adjacent_tiles(field):
+    w, h = field.shape
+    result = set()
+    xs, ys = np.where(field == 1)
+    for cx, cy in zip(xs.tolist(), ys.tolist()):
+        for _, dx, dy in DIRECTIONS:
+            x, y = cx + dx, cy + dy
+            if 0 <= x < w and 0 <= y < h and field[x, y] == 0:
+                result.add((x, y))
+    return result
+
+
+def opponent_adjacent_tiles(field, others):
+    w, h = field.shape
+    result = set()
+    for _, _, _, (ox, oy) in others:
+        for _, dx, dy in DIRECTIONS:
+            x, y = ox + dx, oy + dy
+            if 0 <= x < w and 0 <= y < h and field[x, y] == 0:
+                result.add((x, y))
+    return result
+
+
+def nearest_coin_distance(game_state):
+    if game_state is None or not game_state['coins']:
+        return None
+    field, bombs, others = game_state['field'], game_state['bombs'], game_state['others']
+    _, _, _, pos = game_state['self']
+    danger = compute_danger_tiles(field, bombs, game_state['explosion_map'])
+    dist, _ = bfs(field, bombs, others, pos, danger)
+    vals = [dist[c] for c in game_state['coins'] if c in dist]
+    return min(vals) if vals else None
+
+
+def nearest_crate_distance(game_state):
+    field, bombs, others = game_state['field'], game_state['bombs'], game_state['others']
+    _, _, _, pos = game_state['self']
+    targets = crate_adjacent_tiles(field)
+    if not targets:
+        return None
+    danger = compute_danger_tiles(field, bombs, game_state['explosion_map'])
+    dist, _ = bfs(field, bombs, others, pos, danger)
+    vals = [dist[t] for t in targets if t in dist]
+    return min(vals) if vals else None
+
+
+def nearest_opponent_distance(game_state):
+    if game_state is None or not game_state['others']:
+        return None
+    field, bombs, others = game_state['field'], game_state['bombs'], game_state['others']
+    _, _, _, pos = game_state['self']
+    targets = opponent_adjacent_tiles(field, others)
+    if not targets:
+        return None
+    danger = compute_danger_tiles(field, bombs, game_state['explosion_map'])
+    dist, _ = bfs(field, bombs, others, pos, danger)
+    vals = [dist[t] for t in targets if t in dist]
+    return min(vals) if vals else None
+
+
+def state_to_features(game_state):
     if game_state is None:
         return None
-
-    field = game_state['field']
-    bombs = game_state['bombs']
-    others = game_state['others']
-    coins = game_state['coins']
-    explosion_map = game_state['explosion_map']
+    field, bombs, others, coins = (game_state[k] for k in ('field', 'bombs', 'others', 'coins'))
     _, _, bomb_possible, pos = game_state['self']
-
-    dist, first_step = bfs(field, bombs, others, pos)
-
-    coin_onehot = [0, 0, 0, 0]
-    reachable_coins = [c for c in coins if c in dist]
-    if reachable_coins:
-        nearest = min(reachable_coins, key=lambda c: dist[c])
-        direction = first_step[nearest]
-        if direction is not None:
-            coin_onehot[[d[0] for d in DIRECTIONS].index(direction)] = 1
-
-    free = [1 if is_free(field, bombs, others, pos[0] + dx, pos[1] + dy) else 0
-            for _, dx, dy in DIRECTIONS]
-
-    danger = compute_danger_tiles(field, bombs, explosion_map)
-    in_danger = 1 if pos in danger else 0
-
-    escape_onehot = [0, 0, 0, 0]
-    escape_dir = bfs_escape(field, bombs, others, danger, pos)
-    if escape_dir is not None:
-        escape_onehot[[d[0] for d in DIRECTIONS].index(escape_dir)] = 1
-
-    return np.array(
-        [1.0] + coin_onehot + free + [in_danger] + escape_onehot + [1 if bomb_possible else 0],
-        dtype=np.float32,
-    )
+    danger = compute_danger_tiles(field, bombs, game_state['explosion_map'])
+    dist, first = bfs(field, bombs, others, pos, danger)
+    coin_dir = direction_onehot(nearest_target_direction(dist, first, coins))
+    free = [int(is_free(field, bombs, others, pos[0] + dx, pos[1] + dy)) for _, dx, dy in DIRECTIONS]
+    in_danger = int(pos in danger)
+    escape = direction_onehot(bfs_escape(field, bombs, others, danger, pos))
+    crates = crate_adjacent_tiles(field)
+    crate_dir = direction_onehot(nearest_target_direction(dist, first, crates))
+    hits_crate = int(bomb_would_hit_crate(field, pos))
+    opponents = opponent_adjacent_tiles(field, others)
+    opponent_dir = direction_onehot(nearest_target_direction(dist, first, opponents))
+    hits_opponent = int(bomb_would_hit_opponents(field, pos, others))
+    safe_bomb = int(bomb_possible and is_safe_to_bomb(field, bombs, others, pos))
+    return np.asarray([1.0] + coin_dir + free + [in_danger] + escape + [int(bomb_possible)] + crate_dir + [hits_crate] + opponent_dir + [hits_opponent, safe_bomb], dtype=np.float32)
